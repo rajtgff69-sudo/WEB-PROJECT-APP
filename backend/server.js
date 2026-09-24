@@ -23,9 +23,58 @@ const SOUND_DIR = path.join(__dirname, 'sounds');
 const clients = new Map();
 const botState = new Map();
 const audioPlayers = new Map();
+const botConnections = new Map();
 
 if (!fs.existsSync(SOUND_DIR)) {
   fs.mkdirSync(SOUND_DIR, { recursive: true });
+}
+
+function botConnectionKey(token, guildId) {
+  return `${token}:${guildId}`;
+}
+
+async function fetchMember(client, guild, userId) {
+  if (!guild || !userId) return null;
+  if (guild.members.cache.has(userId)) return guild.members.cache.get(userId);
+  try {
+    return await guild.members.fetch(userId);
+  } catch (error) {
+    return null;
+  }
+}
+
+async function joinBotToVoiceChannel(client, token, guildId, channelId) {
+  const guild = client.guilds.cache.get(guildId);
+  const key = botConnectionKey(token, guildId);
+  const existing = botConnections.get(key);
+
+  if (existing && existing.state.status !== VoiceConnectionStatus.Destroyed && existing.joinConfig?.channelId === String(channelId)) {
+    return existing;
+  }
+
+  if (existing && existing.state.status !== VoiceConnectionStatus.Destroyed) {
+    existing.destroy();
+  }
+
+  const connection = joinVoiceChannel({
+    channelId: String(channelId),
+    guildId,
+    adapterCreator: guild?.voiceAdapterCreator ?? client.guilds.cache.get(guildId)?.voiceAdapterCreator,
+    selfDeaf: false,
+    selfMute: false
+  });
+
+  botConnections.set(key, connection);
+  connection.on('stateChange', (oldState, newState) => {
+    if (newState.status === VoiceConnectionStatus.Destroyed || newState.status === VoiceConnectionStatus.Disconnected) {
+      if (botConnections.get(key) === connection) {
+        botConnections.delete(key);
+      }
+    }
+  });
+
+  await entersState(connection, VoiceConnectionStatus.Ready, 15000).catch(() => {});
+  return connection;
 }
 
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type'] }));
@@ -84,12 +133,19 @@ async function resolveGuildForVc(client, channelId) {
 
 async function leaveAll(client, token) {
   const state = ensureBotState(token);
-  const ids = [...state.joined];
+  const ids = [...new Set(state.joined)];
   state.joined = [];
 
   for (const guildId of ids) {
-    const conn = getVoiceConnection(guildId);
+    const key = botConnectionKey(token, guildId);
+    const conn = botConnections.get(key) || getVoiceConnection(guildId);
     if (conn) conn.destroy();
+    botConnections.delete(key);
+    if (audioPlayers.has(key)) {
+      const player = audioPlayers.get(key);
+      player?.stop();
+      audioPlayers.delete(key);
+    }
   }
 
   return { left: ids.length };
@@ -98,7 +154,7 @@ async function leaveAll(client, token) {
 async function muteAll(client, token) {
   let muted = 0;
   for (const guild of client.guilds.cache.values()) {
-    const member = guild.members.cache.get(client.user.id);
+    const member = await fetchMember(client, guild, client.user.id);
     if (!member || !member.voice.channelId) continue;
     await member.voice.setMute(true).catch(() => {});
     muted += 1;
@@ -109,7 +165,7 @@ async function muteAll(client, token) {
 async function unmuteAll(client, token) {
   let unmuted = 0;
   for (const guild of client.guilds.cache.values()) {
-    const member = guild.members.cache.get(client.user.id);
+    const member = await fetchMember(client, guild, client.user.id);
     if (!member || !member.voice.channelId) continue;
     await member.voice.setMute(false).catch(() => {});
     unmuted += 1;
@@ -120,7 +176,7 @@ async function unmuteAll(client, token) {
 async function deafenAll(client, token) {
   let deafened = 0;
   for (const guild of client.guilds.cache.values()) {
-    const member = guild.members.cache.get(client.user.id);
+    const member = await fetchMember(client, guild, client.user.id);
     if (!member || !member.voice.channelId) continue;
     await member.voice.setDeaf(true).catch(() => {});
     deafened += 1;
@@ -131,7 +187,7 @@ async function deafenAll(client, token) {
 async function undeafenAll(client, token) {
   let undeafened = 0;
   for (const guild of client.guilds.cache.values()) {
-    const member = guild.members.cache.get(client.user.id);
+    const member = await fetchMember(client, guild, client.user.id);
     if (!member || !member.voice.channelId) continue;
     await member.voice.setDeaf(false).catch(() => {});
     undeafened += 1;
@@ -151,14 +207,15 @@ async function playLocalSoundForToken(token, channelId, soundPath, volume = 100)
     throw new Error('Sound file does not exist on disk: ' + resolvedPath);
   }
 
-  const connection = getVoiceConnection(guildId) || joinVoiceChannel({
-    channelId,
-    guildId,
-    adapterCreator: client.guilds.cache.get(guildId)?.voiceAdapterCreator
-  });
-
+  const connection = await joinBotToVoiceChannel(client, token, guildId, channelId);
   if (connection.state.status !== VoiceConnectionStatus.Ready) {
     await entersState(connection, VoiceConnectionStatus.Ready, 15000);
+  }
+
+  const key = botConnectionKey(token, guildId);
+  const existingPlayer = audioPlayers.get(key);
+  if (existingPlayer) {
+    existingPlayer.stop();
   }
 
   const player = createAudioPlayer({
@@ -175,7 +232,7 @@ async function playLocalSoundForToken(token, channelId, soundPath, volume = 100)
 
   player.play(resource);
   connection.subscribe(player);
-  audioPlayers.set(`${token}:${guildId}`, player);
+  audioPlayers.set(key, player);
 
   return { ok: true, guildId, channelId, sound: resolvedPath, volume };
 }
@@ -245,19 +302,10 @@ app.post('/api/action', async (req, res) => {
             continue;
           }
 
-          const guild = client.guilds.cache.get(guildId);
-          const connection = joinVoiceChannel({
-            channelId: String(vcId),
-            guildId,
-            adapterCreator: guild?.voiceAdapterCreator ?? client.guilds.cache.get(guildId)?.voiceAdapterCreator,
-            selfDeaf: false,
-            selfMute: false
-          });
-
-          await entersState(connection, VoiceConnectionStatus.Ready, 15000).catch(() => {});
+          const connection = await joinBotToVoiceChannel(client, currentToken, guildId, vcId);
           const state = ensureBotState(currentToken);
           state.joined = [...new Set([...state.joined, guildId])];
-          results.push({ token: currentToken, ok: true, guildId, channelId: vcId, mode });
+          results.push({ token: currentToken, ok: true, guildId, channelId: vcId, connectionStatus: connection.state.status, mode });
         } catch (error) {
           results.push({ token: currentToken, ok: false, error: String(error.message || error) });
         }

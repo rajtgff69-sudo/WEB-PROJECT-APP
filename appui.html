@@ -1666,6 +1666,7 @@ input[type=range]::-moz-range-thumb{width:22px;height:22px;border-radius:50%;bac
   /* ============ NATIVE BRIDGE ============ */
   var bridgeReady = !!(window.AndroidBot && typeof window.AndroidBot.postMessage === "function");
   var backendCandidates = [
+    "https://web-project-app.onrender.com",
     "http://10.0.2.2:3000",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
@@ -1958,15 +1959,22 @@ input[type=range]::-moz-range-thumb{width:22px;height:22px;border-radius:50%;bac
       }
 
       var actionName = total === 1 ? "join" : "joinAll";
-      send(actionName, {
+      var payload = {
         vcId: vcId,
-        token: token,
         mode: joinMode,
-        joinQuantity: succeeded + 1,
+        joinQuantity: total,
         botIndex: item.index,
         botTotal: total,
         botQuantity: tokens.length
-      });
+      };
+
+      if (actionName === "join") {
+        payload.token = token;
+      } else {
+        payload.tokens = queue.map(function (q) { return q.token; });
+      }
+
+      send(actionName, payload);
 
       log("info", "▶ Bot " + item.index + " / " + total + " join request → VC " + vcId + " (delay 50ms)");
       setTimeout(function () {
